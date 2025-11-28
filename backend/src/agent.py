@@ -2,10 +2,8 @@
 import logging
 import os
 import json
-import re
-import uuid
-import datetime
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 
@@ -21,239 +19,230 @@ from livekit.agents import (
     tokenize,
     function_tool,
     RunContext,
-    MetricsCollectedEvent,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+logger = logging.getLogger("agent_day7")
 logger.setLevel(logging.INFO)
 
-# Load env vars from .env.local
 load_dotenv(".env.local")
 
-# ------- Paths & constants -------
+# Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "shared-data")
-os.makedirs(DATA_DIR, exist_ok=True)
+SHARED_DIR = os.path.join(BASE_DIR, "shared-data")
+os.makedirs(SHARED_DIR, exist_ok=True)
+CATALOG_PATH = os.path.join(SHARED_DIR, "catalog.json")
+ORDERS_PATH = os.path.join(SHARED_DIR, "orders.json")
 
-FAQ_FILE = os.path.join(DATA_DIR, "company_faq_lenskart.json")
-LEADS_FILE = os.path.join(DATA_DIR, "leads_lenskart.json")
-
-# Developer-uploaded screenshot (included in prompts / demo)
-FILE_URL = "/mnt/data/Screenshot 2025-11-22 222905.png"
-
-# ------- Ensure files exist & load FAQ -------
-DEFAULT_FAQ = {
-    "company": "Lenskart",
-    "overview": "Lenskart is India's leading eyewear brand offering eyeglasses, sunglasses, contact lenses, and home eye check-ups.",
-    "faq": [
-        {"q": "What products do you offer?", "a": "We offer prescription eyeglasses, sunglasses, contact lenses, powered sunglasses, and accessories. We also provide home eye check-ups."},
-        {"q": "Do you offer a free eye test?", "a": "Yes! Lenskart provides a free home eye test in multiple cities with certified optometrists."},
-        {"q": "What is your pricing?", "a": "Eyeglasses start from ₹499, premium collections from ₹1500+, sunglasses from ₹599, and contact lenses from ₹199 onwards."},
-        {"q": "Do you have a return or exchange policy?", "a": "Yes, Lenskart offers a 14-day no-questions-asked return or exchange policy on most products."},
-        {"q": "How fast is delivery?", "a": "Standard eyeglasses are delivered within 3–7 days. Contact lenses and ready stock items ship faster."},
-        {"q": "Do you have a free trial?", "a": "Yes! You can use the 3D Try-On on the app or website. Some frames also support Home Try-On."},
-        {"q": "Who is Lenskart for?", "a": "Anyone who wants stylish, durable eyewear — students, professionals, seniors, or kids."}
-    ]
-}
-
-def load_faq() -> Dict[str, Any]:
-    if not os.path.exists(FAQ_FILE):
-        with open(FAQ_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_FAQ, f, indent=2, ensure_ascii=False)
-        return DEFAULT_FAQ
-    with open(FAQ_FILE, "r", encoding="utf-8") as f:
+# --------- Catalog loader --------- #
+def _load_catalog() -> List[Dict[str, Any]]:
+    if not os.path.exists(CATALOG_PATH):
+        raise FileNotFoundError(f"Catalog missing at {CATALOG_PATH}. Create a catalog.json in shared-data.")
+    with open(CATALOG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-FAQ = load_faq()
+CATALOG = _load_catalog()
+CATALOG_BY_ID = {item["id"]: item for item in CATALOG}
+CATALOG_INDEX = {item["name"].lower(): item for item in CATALOG}
 
-def ensure_leads_file():
-    if not os.path.exists(LEADS_FILE):
-        with open(LEADS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2, ensure_ascii=False)
+# Simple recipes mapping (dish -> list of catalog IDs)
+RECIPES = {
+    "peanut butter sandwich": ["bread_whole", "peanut_butter"],
+    "pasta for two": ["pasta_500g", "pasta_sauce", "butter"],
+    "sandwich": ["bread_whole", "butter", "jam"],
+}
 
-ensure_leads_file()
+# --------- Orders persistence helpers --------- #
+def _ensure_orders_file():
+    if not os.path.exists(ORDERS_PATH):
+        with open(ORDERS_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, indent=2)
 
-# ------- Simple keyword FAQ lookup -------
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+def _append_order(order: Dict[str, Any]):
+    _ensure_orders_file()
+    # load existing, append, write back
+    with open(ORDERS_PATH, "r+", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except Exception:
+            data = []
+        data.append(order)
+        f.seek(0)
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.truncate()
 
-def keyword_search_faq(query: str, top_n: int = 3) -> List[Dict[str, str]]:
-    qnorm = _normalize(query)
-    tokens = [t for t in re.split(r"\W+", qnorm) if t and len(t) > 2]
-    matches = []
-    overview = _normalize(FAQ.get("overview", ""))
-    if any(tok in overview for tok in tokens):
-        matches.append({"q": "About Lenskart", "a": FAQ.get("overview", "")})
-    for item in FAQ.get("faq", []):
-        cand = _normalize(item.get("q", "") + " " + item.get("a", ""))
-        if any(tok in cand for tok in tokens):
-            matches.append(item)
-    # dedupe and limit
-    seen = set()
-    out = []
-    for m in matches:
-        key = m.get("q", "")
-        if key not in seen:
-            out.append(m)
-            seen.add(key)
-        if len(out) >= top_n:
-            break
-    if not out:
-        out = FAQ.get("faq", [])[:top_n]
-    return out
-
-# ------- Validators -------
-EMAIL_RE = re.compile(r"[^@]+@[^@]+\.[^@]+")
-def is_valid_email(e: str) -> bool:
-    return bool(EMAIL_RE.match((e or "").strip()))
-
-# ------- Tools exposed to the LLM -------
-@function_tool
-async def find_faq(ctx: RunContext, question: str) -> Dict[str, Any]:
-    """Return top-matching FAQ entries. MUST be used for product/company questions."""
-    matches = keyword_search_faq(question)
-    return {"matches": matches}
+# ---------- Tools (exposed to model) ---------- #
 
 @function_tool
-async def fill_lead_field(ctx: RunContext, field: str, value: str) -> Dict[str, Any]:
-    """
-    Deterministically fill one lead field in session.userdata['lead'].
-    Use synonyms mapping; returns updated lead.
-    """
+async def list_catalog(ctx: RunContext) -> List[Dict[str, Any]]:
+    """Return a short list of catalog items for the model."""
+    return [{"id": c["id"], "name": c["name"], "price": c["price"], "units": c.get("units")} for c in CATALOG]
+
+@function_tool
+async def add_item(ctx: RunContext, item_id: str, qty: int = 1) -> str:
+    """Add item by id into session cart."""
     session = ctx.session
-    ud = getattr(session, "userdata", {})
-    lead = ud.get("lead", {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None})
-    f = field.strip().lower()
-    synonyms = {
-        "name": "name", "fullname": "name",
-        "email": "email", "e-mail": "email",
-        "company": "company", "org": "company",
-        "role": "role", "position": "role",
-        "usecase": "use_case", "use case": "use_case", "use_case": "use_case",
-        "team size": "team_size", "teamsize": "team_size", "team_size": "team_size",
-        "timeline": "timeline", "when": "timeline"
-    }
-    f = synonyms.get(f, f)
-    lead[f] = value.strip()
-    ud["lead"] = lead
-    asked = ud.get("asked", [])
-    if f not in asked:
-        asked.append(f)
-        ud["asked"] = asked
-    session.userdata = ud
-    return {"lead": lead}
+    cart = session.userdata.setdefault("cart", {})
+    if item_id not in CATALOG_BY_ID:
+        return f"Item id '{item_id}' not found in catalog."
+    entry = cart.get(item_id, {"qty": 0})
+    entry["qty"] = entry.get("qty", 0) + max(1, int(qty))
+    cart[item_id] = entry
+    session.userdata["cart"] = cart
+    item = CATALOG_BY_ID[item_id]
+    return f"Added {entry['qty']} × {item['name']} to your cart."
 
 @function_tool
-async def save_lead(ctx: RunContext, lead: Dict[str, Any]) -> Dict[str, str]:
-    """Persist lead to JSON and return ID."""
-    ensure_leads_file()
-    with open(LEADS_FILE, "r", encoding="utf-8") as f:
-        arr = json.load(f)
-    entry = dict(lead)
-    entry["_id"] = str(uuid.uuid4())[:8]
-    entry["created_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-    arr.append(entry)
-    with open(LEADS_FILE, "w", encoding="utf-8") as f:
-        json.dump(arr, f, indent=2, ensure_ascii=False)
-    return {"id": entry["_id"]}
-
-@function_tool
-async def get_lead_summary(ctx: RunContext, lead: Dict[str, Any]) -> str:
-    """Return a compact spoken summary string for recap."""
-    name = lead.get("name") or "(unknown)"
-    email = lead.get("email") or "(unknown)"
-    use_case = lead.get("use_case") or "(not provided)"
-    team = lead.get("team_size") or "(unknown)"
-    timeline = lead.get("timeline") or "(unspecified)"
-    return f"{name} ({email}) is interested in {use_case}. Team size: {team}. Timeline: {timeline}."
-
-@function_tool
-async def ask_next_field(ctx: RunContext) -> Dict[str, Any]:
-    """
-    Server-side helper the LLM can call to get the next missing lead field and a suggested question.
-    Returns: {field: str, question: str, required: bool}
-    """
+async def remove_item(ctx: RunContext, item_id: str) -> str:
     session = ctx.session
-    ud = getattr(session, "userdata", {})
-    lead = ud.get("lead", {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None})
-    order = ["name", "email", "company", "role", "use_case", "team_size", "timeline"]
-    labels = {
-        "name": "Could I get your full name?",
-        "email": "What's the best email to reach you at?",
-        "company": "Which company are you with (if any)?",
-        "role": "What's your role there?",
-        "use_case": "What would you use Lenskart for (e.g., team purchase, personal prescription, contact lenses)?",
-        "team_size": "How many people are in your team?",
-        "timeline": "What's your expected timeline? (now / soon / later)"
-    }
-    for f in order:
-        if not lead.get(f):
-            return {"field": f, "question": labels[f], "required": True}
-    # all present
-    return {"field": "", "question": "", "required": False}
+    cart = session.userdata.setdefault("cart", {})
+    if item_id in cart:
+        del cart[item_id]
+        session.userdata["cart"] = cart
+        return f"Removed {item_id} from your cart."
+    return f"Item {item_id} not in your cart."
 
-# ------- Murf TTS voices (session-level TTS intentionally NOT set) ------
-TTS_SDR = murf.TTS(
+@function_tool
+async def update_qty(ctx: RunContext, item_id: str, qty: int) -> str:
+    session = ctx.session
+    cart = session.userdata.setdefault("cart", {})
+    if item_id not in CATALOG_BY_ID:
+        return f"Unknown item id {item_id}."
+    if qty <= 0:
+        if item_id in cart:
+            del cart[item_id]
+        session.userdata["cart"] = cart
+        return f"Removed {item_id} from the cart."
+    cart[item_id] = {"qty": qty}
+    session.userdata["cart"] = cart
+    return f"Updated quantity: {qty} × {CATALOG_BY_ID[item_id]['name']}."
+
+@function_tool
+async def show_cart(ctx: RunContext) -> Dict[str, Any]:
+    session = ctx.session
+    cart = session.userdata.get("cart", {})
+    items = []
+    total = 0.0
+    for item_id, info in cart.items():
+        item = CATALOG_BY_ID.get(item_id)
+        if not item:
+            continue
+        qty = info.get("qty", 1)
+        price = item.get("price", 0)
+        subtotal = price * qty
+        items.append({"id": item_id, "name": item["name"], "qty": qty, "price": price, "subtotal": subtotal})
+        total += subtotal
+    return {"items": items, "total": round(total, 2)}
+
+@function_tool
+async def add_recipe_items(ctx: RunContext, dish_name: str, servings: int = 1) -> str:
+    key = dish_name.strip().lower()
+    if key not in RECIPES:
+        return f"Don't have a recipe for '{dish_name}'. Try 'peanut butter sandwich' or 'pasta for two'."
+    session = ctx.session
+    cart = session.userdata.setdefault("cart", {})
+    added = []
+    for item_id in RECIPES[key]:
+        base_qty = 1
+        qty = max(1, int(servings * base_qty))
+        entry = cart.get(item_id, {"qty": 0})
+        entry["qty"] = entry.get("qty", 0) + qty
+        cart[item_id] = entry
+        added.append(CATALOG_BY_ID[item_id]["name"])
+    session.userdata["cart"] = cart
+    return f"Added {', '.join(added)} to your cart for '{dish_name}'."
+
+@function_tool
+async def place_order(ctx: RunContext, customer_name: Optional[str] = "Guest", address: Optional[str] = "") -> Dict[str, Any]:
+    session = ctx.session
+    cart = session.userdata.get("cart", {})
+    if not cart:
+        return {"error": "cart_empty", "message": "Your cart is empty."}
+    order_items = []
+    total = 0.0
+    for item_id, info in cart.items():
+        item = CATALOG_BY_ID.get(item_id)
+        if not item:
+            continue
+        qty = info.get("qty", 1)
+        subtotal = item["price"] * qty
+        order_items.append({"id": item_id, "name": item["name"], "qty": qty, "unit_price": item["price"], "subtotal": subtotal})
+        total += subtotal
+    order = {
+        "order_id": f"ORD-{int(datetime.utcnow().timestamp())}",
+        "customer_name": customer_name,
+        "address": address,
+        "items": order_items,
+        "total": round(total, 2),
+        "timestamp": datetime.utcnow().isoformat(),
+        "status": "placed"
+    }
+    _append_order(order)
+    # clear cart
+    session.userdata["cart"] = {}
+    return {"success": True, "order": order}
+
+# ---------- Agent class and behavior ---------- #
+
+# Murf Falcon TTS voice (change IDs if your Murf voice names differ)
+TTS_MATTHEW = murf.TTS(
     voice="en-US-matthew",
     style="Conversation",
     tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
     text_pacing=True,
 )
+TTS_ROUTER = TTS_MATTHEW
 
-# ------- SDR Agent class -------
-class LenskartSDRAgent(Agent):
-    def __init__(self):
+class ShoppingAgent(Agent):
+    def __init__(self, **kwargs):
         instructions = f"""
-You are a friendly Lenskart SDR (voice-first). Use the provided tools—find_faq, fill_lead_field, ask_next_field, save_lead, get_lead_summary—to answer product questions and capture leads.
+You are a friendly shopping assistant for a demo grocery store. Use the provided tools:
+list_catalog, add_item, remove_item, update_qty, show_cart, add_recipe_items, place_order.
 
-Important rules:
-- For any product/company/pricing question, call `find_faq(question)` and answer ONLY using returned FAQ entries.
-- Fill lead fields deterministically using `fill_lead_field(field, value)`.
-- If you need to solicit missing lead data, call `ask_next_field()`; it returns a (field, question).
-- When all required fields are collected or the user says 'thanks' / 'that's all' / 'i'm done' / 'bye', call `save_lead(lead)` then `get_lead_summary(lead)` and speak the recap.
-- Keep responses short and polite, and confirm important values (e.g., repeat email back for confirmation).
+Available sample recipes:
+{json.dumps(list(RECIPES.keys()), indent=2)}
 
-You can reference the demo screenshot at: {FILE_URL}
+When the user asks for items or recipes, call the appropriate tools.
+Confirm any cart changes verbally and ask follow-ups if needed (size/quantity/address).
+When user says "place my order" or "that's all", call place_order and confirm the order summary.
 """
-        super().__init__(instructions=instructions, tts=TTS_SDR)
+        super().__init__(instructions=instructions, tts=TTS_MATTHEW, **kwargs)
 
     async def on_enter(self) -> None:
-        greeting = (
-            f"Hi — welcome to {FAQ.get('company')}. I'm here to help with frames, sunglasses, contact lenses and home eye check-ups. "
-            "What brought you here today?"
+        # Greeting
+        await self.session.generate_reply(
+            instructions=(
+                "Greet the user warmly: 'Hi! I'm your grocery assistant. I can help you add items, "
+                "add ingredients for a recipe (for example: peanut butter sandwich), show your cart, "
+                "and place your order. What would you like to do today?'"
+            )
         )
-        await self.session.generate_reply(instructions=greeting)
 
-# ------- Prewarm VAD -------
+# ---------- Prewarm VAD ---------- #
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
-# ------- Entrypoint -------
+# ---------- Entrypoint ---------- #
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-        # DO NOT set session-level tts so agent-level TTS is used
+        # leave session-level tts None so agent's tts is used
+        tts=None,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
-        tools=[find_faq, fill_lead_field, ask_next_field, save_lead, get_lead_summary],
+        tools=[list_catalog, add_item, remove_item, update_qty, show_cart, add_recipe_items, place_order],
     )
 
-    # initialize deterministic lead state
-    session.userdata = {
-        "lead": {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None},
-        "asked": []
-    }
+    # initialize userdata
+    session.userdata = {"cart": {}}
 
     usage_collector = metrics.UsageCollector()
-
     @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
+    def _on_metrics_collected(ev):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
@@ -262,7 +251,7 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    await session.start(agent=LenskartSDRAgent(), room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()))
+    await session.start(agent=ShoppingAgent(), room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()))
     await ctx.connect()
 
 if __name__ == "__main__":
