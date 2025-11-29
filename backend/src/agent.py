@@ -1,257 +1,398 @@
-# backend/src/agent.py
+# agent.py - Voice Game Master (D&D-Style Adventure) for Day 8
 import logging
 import os
 import json
+import random
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
-
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
+    cli,
+    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
-    cli,
     metrics,
     tokenize,
     function_tool,
-    RunContext,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent_day7")
-logger.setLevel(logging.INFO)
+logger = logging.getLogger("game_master")
 
 load_dotenv(".env.local")
 
-# Paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SHARED_DIR = os.path.join(BASE_DIR, "shared-data")
-os.makedirs(SHARED_DIR, exist_ok=True)
-CATALOG_PATH = os.path.join(SHARED_DIR, "catalog.json")
-ORDERS_PATH = os.path.join(SHARED_DIR, "orders.json")
+# ---------- Game Universes & World Templates ---------- #
 
-# --------- Catalog loader --------- #
-def _load_catalog() -> List[Dict[str, Any]]:
-    if not os.path.exists(CATALOG_PATH):
-        raise FileNotFoundError(f"Catalog missing at {CATALOG_PATH}. Create a catalog.json in shared-data.")
-    with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+GAME_UNIVERSES = {
+    "fantasy": {
+        "name": "Fantasy Realm",
+        "system_prompt": """You are a wise and dramatic Fantasy Game Master in a world of dragons, magic, and ancient kingdoms.
 
-CATALOG = _load_catalog()
-CATALOG_BY_ID = {item["id"]: item for item in CATALOG}
-CATALOG_INDEX = {item["name"].lower(): item for item in CATALOG}
+UNIVERSE: The realm of Eldoria, where magic flows through the land and ancient prophecies guide destinies.
 
-# Simple recipes mapping (dish -> list of catalog IDs)
-RECIPES = {
-    "peanut butter sandwich": ["bread_whole", "peanut_butter"],
-    "pasta for two": ["pasta_500g", "pasta_sauce", "butter"],
-    "sandwich": ["bread_whole", "butter", "jam"],
+YOUR ROLE:
+- Describe vivid scenes with rich sensory details (sights, sounds, smells)
+- Create compelling NPCs with distinct personalities
+- Present meaningful choices that affect the story
+- Build tension and drama through your narration
+- End each message with a clear choice or question: "What do you do?"
+
+STORY ARC: The player is a young adventurer who discovers an ancient artifact that holds the key to saving the kingdom from an ancient evil.
+
+GAME MASTER GUIDELINES:
+- Always maintain continuity with previous events
+- Remember NPC names, locations, and player decisions
+- Incorporate player choices into the evolving narrative
+- Provide 2-3 clear options when presenting choices
+- Use descriptive language that immerses the player
+- Balance combat, exploration, and roleplaying
+- Make the player feel their decisions matter""",
+        "initial_world": {
+            "player": {
+                "name": "Adventurer",
+                "health": 100,
+                "max_health": 100,
+                "inventory": ["rusty sword", "leather armor", "healing potion"],
+                "gold": 50,
+                "level": 1,
+                "location": "Whispering Woods"
+            },
+            "npcs": {
+                "elder_merlin": {"name": "Elder Merlin", "attitude": "friendly", "alive": True},
+                "dragon_ignis": {"name": "Ignis the Dragon", "attitude": "hostile", "alive": True}
+            },
+            "locations": {
+                "whispering_woods": {"name": "Whispering Woods", "visited": True},
+                "stonehaven_keep": {"name": "Stonehaven Keep", "visited": False},
+                "crystal_caverns": {"name": "Crystal Caverns", "visited": False}
+            },
+            "quests": {
+                "main": {"name": "The Crystal of Eldoria", "status": "active", "progress": 0},
+                "side": {"name": "Help the Village", "status": "available", "progress": 0}
+            },
+            "events": ["arrived_in_whispering_woods"]
+        }
+    },
+    "sci_fi": {
+        "name": "Cyberpunk City", 
+        "system_prompt": """You are a gritty Cyberpunk Game Master in the neon-drenched metropolis of Neo-Tokyo 2088.
+
+UNIVERSE: A dystopian future where mega-corporations rule, cyber-enhancements are common, and hackers fight for freedom.
+
+YOUR ROLE:
+- Describe the cyberpunk world with neon lights, rain-slicked streets, and high-tech gadgets
+- Create morally ambiguous characters and situations
+- Present choices that test the player's ethics and survival instincts
+- Build tension through corporate conspiracies and technological threats
+- End each message with: "What's your move, runner?"
+
+STORY ARC: The player is a freelance hacker who uncovers a corporate plot that could enslave humanity.
+
+GAME MASTER GUIDELINES:
+- Maintain the cyberpunk aesthetic throughout descriptions
+- Remember the player's cyberware, contacts, and reputation
+- Incorporate high-tech elements and hacking opportunities
+- Present dilemmas between profit and principles
+- Use tech jargon appropriately but explain when needed"""
+    },
+    "space": {
+        "name": "Space Opera",
+        "system_prompt": """You are an epic Space Opera Game Master navigating the vast reaches of the Galactic Federation.
+
+UNIVERSE: A universe of alien civilizations, star empires, and ancient cosmic mysteries.
+
+YOUR ROLE:
+- Describe alien worlds, star systems, and futuristic technology
+- Create diverse alien species with unique cultures
+- Present interstellar politics and cosmic threats
+- Build epic space battles and first contact scenarios
+- End each message with: "What's your course of action, Captain?"
+
+STORY ARC: The player commands a starship and must unite warring factions against an extragalactic invasion.
+
+GAME MASTER GUIDELINES:
+- Maintain the scale and wonder of space exploration
+- Remember alien species, political alliances, and star systems
+- Incorporate zero-gravity and space travel elements
+- Present choices that affect interstellar relations
+- Balance scientific accuracy with dramatic storytelling"""
+    }
 }
 
-# --------- Orders persistence helpers --------- #
-def _ensure_orders_file():
-    if not os.path.exists(ORDERS_PATH):
-        with open(ORDERS_PATH, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
+# ---------- Murf TTS voices ---------- #
 
-def _append_order(order: Dict[str, Any]):
-    _ensure_orders_file()
-    # load existing, append, write back
-    with open(ORDERS_PATH, "r+", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception:
-            data = []
-        data.append(order)
-        f.seek(0)
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.truncate()
-
-# ---------- Tools (exposed to model) ---------- #
-
-@function_tool
-async def list_catalog(ctx: RunContext) -> List[Dict[str, Any]]:
-    """Return a short list of catalog items for the model."""
-    return [{"id": c["id"], "name": c["name"], "price": c["price"], "units": c.get("units")} for c in CATALOG]
-
-@function_tool
-async def add_item(ctx: RunContext, item_id: str, qty: int = 1) -> str:
-    """Add item by id into session cart."""
-    session = ctx.session
-    cart = session.userdata.setdefault("cart", {})
-    if item_id not in CATALOG_BY_ID:
-        return f"Item id '{item_id}' not found in catalog."
-    entry = cart.get(item_id, {"qty": 0})
-    entry["qty"] = entry.get("qty", 0) + max(1, int(qty))
-    cart[item_id] = entry
-    session.userdata["cart"] = cart
-    item = CATALOG_BY_ID[item_id]
-    return f"Added {entry['qty']} × {item['name']} to your cart."
-
-@function_tool
-async def remove_item(ctx: RunContext, item_id: str) -> str:
-    session = ctx.session
-    cart = session.userdata.setdefault("cart", {})
-    if item_id in cart:
-        del cart[item_id]
-        session.userdata["cart"] = cart
-        return f"Removed {item_id} from your cart."
-    return f"Item {item_id} not in your cart."
-
-@function_tool
-async def update_qty(ctx: RunContext, item_id: str, qty: int) -> str:
-    session = ctx.session
-    cart = session.userdata.setdefault("cart", {})
-    if item_id not in CATALOG_BY_ID:
-        return f"Unknown item id {item_id}."
-    if qty <= 0:
-        if item_id in cart:
-            del cart[item_id]
-        session.userdata["cart"] = cart
-        return f"Removed {item_id} from the cart."
-    cart[item_id] = {"qty": qty}
-    session.userdata["cart"] = cart
-    return f"Updated quantity: {qty} × {CATALOG_BY_ID[item_id]['name']}."
-
-@function_tool
-async def show_cart(ctx: RunContext) -> Dict[str, Any]:
-    session = ctx.session
-    cart = session.userdata.get("cart", {})
-    items = []
-    total = 0.0
-    for item_id, info in cart.items():
-        item = CATALOG_BY_ID.get(item_id)
-        if not item:
-            continue
-        qty = info.get("qty", 1)
-        price = item.get("price", 0)
-        subtotal = price * qty
-        items.append({"id": item_id, "name": item["name"], "qty": qty, "price": price, "subtotal": subtotal})
-        total += subtotal
-    return {"items": items, "total": round(total, 2)}
-
-@function_tool
-async def add_recipe_items(ctx: RunContext, dish_name: str, servings: int = 1) -> str:
-    key = dish_name.strip().lower()
-    if key not in RECIPES:
-        return f"Don't have a recipe for '{dish_name}'. Try 'peanut butter sandwich' or 'pasta for two'."
-    session = ctx.session
-    cart = session.userdata.setdefault("cart", {})
-    added = []
-    for item_id in RECIPES[key]:
-        base_qty = 1
-        qty = max(1, int(servings * base_qty))
-        entry = cart.get(item_id, {"qty": 0})
-        entry["qty"] = entry.get("qty", 0) + qty
-        cart[item_id] = entry
-        added.append(CATALOG_BY_ID[item_id]["name"])
-    session.userdata["cart"] = cart
-    return f"Added {', '.join(added)} to your cart for '{dish_name}'."
-
-@function_tool
-async def place_order(ctx: RunContext, customer_name: Optional[str] = "Guest", address: Optional[str] = "") -> Dict[str, Any]:
-    session = ctx.session
-    cart = session.userdata.get("cart", {})
-    if not cart:
-        return {"error": "cart_empty", "message": "Your cart is empty."}
-    order_items = []
-    total = 0.0
-    for item_id, info in cart.items():
-        item = CATALOG_BY_ID.get(item_id)
-        if not item:
-            continue
-        qty = info.get("qty", 1)
-        subtotal = item["price"] * qty
-        order_items.append({"id": item_id, "name": item["name"], "qty": qty, "unit_price": item["price"], "subtotal": subtotal})
-        total += subtotal
-    order = {
-        "order_id": f"ORD-{int(datetime.utcnow().timestamp())}",
-        "customer_name": customer_name,
-        "address": address,
-        "items": order_items,
-        "total": round(total, 2),
-        "timestamp": datetime.utcnow().isoformat(),
-        "status": "placed"
-    }
-    _append_order(order)
-    # clear cart
-    session.userdata["cart"] = {}
-    return {"success": True, "order": order}
-
-# ---------- Agent class and behavior ---------- #
-
-# Murf Falcon TTS voice (change IDs if your Murf voice names differ)
-TTS_MATTHEW = murf.TTS(
+TTS_GAME_MASTER = murf.TTS(
     voice="en-US-matthew",
-    style="Conversation",
+    style="Story",
     tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
     text_pacing=True,
 )
-TTS_ROUTER = TTS_MATTHEW
 
-class ShoppingAgent(Agent):
-    def __init__(self, **kwargs):
-        instructions = f"""
-You are a friendly shopping assistant for a demo grocery store. Use the provided tools:
-list_catalog, add_item, remove_item, update_qty, show_cart, add_recipe_items, place_order.
+# ---------- Game Master Agent ---------- #
 
-Available sample recipes:
-{json.dumps(list(RECIPES.keys()), indent=2)}
+class GameMasterAgent(Agent):
+    """
+    D&D-Style Voice Game Master for Interactive Adventures
+    """
 
-When the user asks for items or recipes, call the appropriate tools.
-Confirm any cart changes verbally and ask follow-ups if needed (size/quantity/address).
-When user says "place my order" or "that's all", call place_order and confirm the order summary.
-"""
-        super().__init__(instructions=instructions, tts=TTS_MATTHEW, **kwargs)
+    def __init__(self, universe: str = "fantasy", **kwargs):
+        self.universe = universe
+        universe_config = GAME_UNIVERSES[universe]
+
+        super().__init__(
+            instructions=universe_config["system_prompt"],
+            tts=TTS_GAME_MASTER,
+            **kwargs
+        )
 
     async def on_enter(self) -> None:
-        # Greeting
+        # Initialize game state
+        game_state = _ensure_game_state(self.session)
+        universe_config = GAME_UNIVERSES[self.universe]
+
+        if "initial_world" in universe_config:
+            game_state["world"] = universe_config["initial_world"].copy()
+
+        # Start the adventure
         await self.session.generate_reply(
             instructions=(
-                "Greet the user warmly: 'Hi! I'm your grocery assistant. I can help you add items, "
-                "add ingredients for a recipe (for example: peanut butter sandwich), show your cart, "
-                "and place your order. What would you like to do today?'"
+                "Begin the adventure with an immersive opening scene that introduces the setting, "
+                "establishes the initial conflict, and presents the player with their first meaningful choice. "
+                "Describe the environment vividly and end by asking what the player wants to do."
             )
         )
 
-# ---------- Prewarm VAD ---------- #
+    # ---------- Game Mechanics Tools ---------- #
+
+    @function_tool()
+    async def roll_dice(self, context: RunContext, sides: int = 20, modifier: int = 0) -> str:
+        """Roll dice for game mechanics - used for skill checks, combat, and random events"""
+        roll = random.randint(1, sides)
+        total = roll + modifier
+
+        logger.info(f"Dice roll: {roll} (d{sides}) + {modifier} = {total}")
+
+        # Determine success level
+        if roll == 1:
+            outcome = "CRITICAL FAILURE"
+        elif roll == 20:
+            outcome = "CRITICAL SUCCESS" 
+        elif total >= 15:
+            outcome = "SUCCESS"
+        elif total >= 10:
+            outcome = "PARTIAL SUCCESS"
+        else:
+            outcome = "FAILURE"
+
+        return f"🎲 Roll: {roll} (d{sides}) + {modifier} = {total} - {outcome}"
+
+    @function_tool()
+    async def update_player_stats(self, context: RunContext, 
+                                health_change: int = 0,
+                                gold_change: int = 0,
+                                add_item: str = "",
+                                remove_item: str = "") -> str:
+        """Update player character statistics and inventory"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        player = game_state["world"]["player"]
+
+        # Update health
+        if health_change != 0:
+            player["health"] = max(0, min(player["max_health"], player["health"] + health_change))
+
+        # Update gold
+        if gold_change != 0:
+            player["gold"] = max(0, player["gold"] + gold_change)
+
+        # Add item
+        if add_item and add_item not in player["inventory"]:
+            player["inventory"].append(add_item)
+
+        # Remove item
+        if remove_item and remove_item in player["inventory"]:
+            player["inventory"].remove(remove_item)
+
+        return f"Player stats updated. Health: {player['health']}, Gold: {player['gold']}, Items: {len(player['inventory'])}"
+
+    @function_tool()
+    async def check_inventory(self, context: RunContext) -> str:
+        """Check player's current inventory and stats"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        player = game_state["world"]["player"]
+
+        inventory_text = ", ".join(player["inventory"]) if player["inventory"] else "Empty"
+
+        return (f"🧙‍♂️ Character Sheet:\n"
+                f"Health: {player['health']}/{player['max_health']} ❤️\n"
+                f"Gold: {player['gold']} 🪙\n"
+                f"Level: {player['level']} ⭐\n"
+                f"Location: {player['location']} 🗺️\n"
+                f"Inventory: {inventory_text}")
+
+    @function_tool()
+    async def add_game_event(self, context: RunContext, event: str) -> str:
+        """Record a significant game event that affects the story"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        if "events" not in game_state["world"]:
+            game_state["world"]["events"] = []
+
+        game_state["world"]["events"].append(event)
+        logger.info(f"Game event recorded: {event}")
+
+        return f"Event '{event}' added to game history."
+
+    @function_tool()
+    async def change_location(self, context: RunContext, new_location: str) -> str:
+        """Move player to a new location in the game world"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        old_location = game_state["world"]["player"]["location"]
+        game_state["world"]["player"]["location"] = new_location
+
+        # Mark location as visited
+        for loc_key, loc_data in game_state["world"]["locations"].items():
+            if loc_data["name"] == new_location:
+                loc_data["visited"] = True
+
+        return f"Player moved from {old_location} to {new_location}."
+
+    @function_tool()
+    async def save_game(self, context: RunContext) -> str:
+        """Save current game state to a JSON file"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"game_save_{timestamp}.json"
+
+        save_data = {
+            "timestamp": datetime.now().isoformat(),
+            "universe": self.universe,
+            "world_state": game_state["world"],
+            "summary": f"Adventure in {GAME_UNIVERSES[self.universe]['name']}"
+        }
+
+        with open(filename, 'w') as f:
+            json.dump(save_data, f, indent=2)
+
+        logger.info(f"Game saved to {filename}")
+        return f"Game saved successfully! File: {filename}"
+
+    @function_tool()
+    async def combat_round(self, context: RunContext, enemy: str, enemy_health: int) -> str:
+        """Execute a combat round against an enemy"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+
+        # Player attack
+        player_roll = random.randint(1, 20)
+        player_damage = random.randint(5, 15)
+
+        # Enemy attack
+        enemy_roll = random.randint(1, 20)
+        enemy_damage = random.randint(3, 12)
+
+        result = f"⚔️ COMBAT ROUND vs {enemy}:\n"
+        result += f"Player attacks: {player_roll} (d20) - "
+
+        if player_roll >= 12:
+            result += f"HIT! {enemy} takes {player_damage} damage!\n"
+            enemy_health -= player_damage
+        else:
+            result += "MISS!\n"
+
+        result += f"{enemy} attacks: {enemy_roll} (d20) - "
+
+        if enemy_roll >= 10:
+            result += f"HIT! You take {enemy_damage} damage!\n"
+            game_state["world"]["player"]["health"] -= enemy_damage
+        else:
+            result += "MISS!\n"
+
+        result += f"Your health: {game_state['world']['player']['health']}\n"
+        result += f"{enemy} health: {max(0, enemy_health)}"
+
+        return result
+
+# ---------- Game State Helpers ---------- #
+
+def _ensure_game_state(session) -> Dict[str, Any]:
+    """Ensure game state exists in session userdata"""
+    ud = session.userdata
+    game = ud.get("game")
+    if not isinstance(game, dict):
+        game = {
+            "world": {},
+            "turn_count": 0,
+            "active_quests": []
+        }
+        ud["game"] = game
+    return game
+
+# ---------- Prewarm ---------- #
+
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 # ---------- Entrypoint ---------- #
+
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
+    # Logging context
+    ctx.log_context_fields = {
+        "room": ctx.room.name,
+    }
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
-        # leave session-level tts None so agent's tts is used
-        tts=None,
+        llm=google.LLM(
+            model="gemini-2.5-flash",
+        ),
+        tts=TTS_GAME_MASTER,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
-        tools=[list_catalog, add_item, remove_item, update_qty, show_cart, add_recipe_items, place_order],
     )
 
-    # initialize userdata
-    session.userdata = {"cart": {}}
+    # Initialize userdata; game state lives under session.userdata["game"]
+    session.userdata = {}
 
     usage_collector = metrics.UsageCollector()
+
     @session.on("metrics_collected")
-    def _on_metrics_collected(ev):
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
     async def log_usage():
-        logger.info("Usage summary: %s", usage_collector.get_summary())
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
 
     ctx.add_shutdown_callback(log_usage)
 
-    await session.start(agent=ShoppingAgent(), room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()))
+    # Start with Game Master Agent (Fantasy universe by default)
+    await session.start(
+        agent=GameMasterAgent(universe="fantasy"),
+        room=ctx.room,
+        room_input_options=RoomInputOptions(
+            noise_cancellation=noise_cancellation.BVC(),
+        ),
+    )
+
     await ctx.connect()
 
 if __name__ == "__main__":
